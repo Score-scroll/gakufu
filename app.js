@@ -336,6 +336,7 @@
   let ourScrollTop = -1;
   let countTimer = 0;
   let wakeLock = null;
+  let pendingReload = false;
 
   // 速さ1〜60 → 1秒あたりのピクセル（表示幅に比例）
   function pxPerSec() {
@@ -413,6 +414,7 @@
     pageUrls = [];
     el.pages.textContent = '';
     cur = null;
+    if (pendingReload) { location.reload(); return; }
     renderLibrary();
   }
 
@@ -546,7 +548,20 @@
 
   // ---------- 起動 ----------
   if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch(() => {}); });
+    // 新しい版が届いたら、楽譜を表示していないときに自動で読み込み直す
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloaded) return;
+      if (cur) { toast('新しい版があります。一覧に戻ると切り替わります'); pendingReload = true; return; }
+      reloaded = true; location.reload();
+    });
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((reg) => reg.update()).catch(() => {});
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') navigator.serviceWorker.getRegistration().then((reg) => reg && reg.update()).catch(() => {});
+    });
   }
   renderLibrary().catch((e) => { console.error(e); alert('保存領域を開けませんでした。プライベートブラウズでは使えません。'); });
 })();
