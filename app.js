@@ -8,11 +8,12 @@
   function db() {
     if (!dbp) {
       dbp = new Promise((res, rej) => {
-        const r = indexedDB.open(DB_NAME, 1);
+        const r = indexedDB.open(DB_NAME, 2);
         r.onupgradeneeded = () => {
           const d = r.result;
           if (!d.objectStoreNames.contains('scores')) d.createObjectStore('scores', { keyPath: 'id' });
           if (!d.objectStoreNames.contains('pages')) d.createObjectStore('pages');
+          if (!d.objectStoreNames.contains('folders')) d.createObjectStore('folders', { keyPath: 'id' });
         };
         r.onsuccess = () => res(r.result);
         r.onerror = () => rej(r.error);
@@ -37,6 +38,18 @@
     put: (s) => tx(['scores'], 'readwrite', (t) => { t.objectStore('scores').put(s); }),
     putPage: (id, i, blob) => tx(['pages'], 'readwrite', (t) => { t.objectStore('pages').put(blob, id + ':' + i); }),
     getPage: (id, i) => tx(['pages'], 'readonly', (t) => reqP(t.objectStore('pages').get(id + ':' + i))),
+    folders: () => tx(['folders'], 'readonly', (t) => reqP(t.objectStore('folders').getAll())),
+    putFolder: (f) => tx(['folders'], 'readwrite', (t) => { t.objectStore('folders').put(f); }),
+    removeFolder: (id) => tx(['folders', 'scores'], 'readwrite', (t) => {
+      t.objectStore('folders').delete(id);
+      const req = t.objectStore('scores').openCursor();
+      req.onsuccess = () => {
+        const c = req.result;
+        if (!c) return;
+        if (c.value.folder === id) { const v = c.value; v.folder = null; c.update(v); }
+        c.continue();
+      };
+    }),
     remove: (s) => tx(['scores', 'pages'], 'readwrite', (t) => {
       t.objectStore('scores').delete(s.id);
       for (let i = 0; i < s.pageCount; i++) t.objectStore('pages').delete(s.id + ':' + i);
@@ -46,12 +59,13 @@
   // ---------- 画面の部品 ----------
   const $ = (id) => document.getElementById(id);
   const el = {
-    library: $('library'), grid: $('grid'), empty: $('empty'), fileInput: $('fileInput'),
+    library: $('library'), grid: $('grid'), empty: $('empty'), emptyText: $('emptyText'), fileInput: $('fileInput'),
     busy: $('busy'), busyText: $('busyText'), busyBar: $('busyBar'),
     viewer: $('viewer'), scroller: $('scroller'), pages: $('pages'), title: $('title'),
     controls: $('controls'), playBtn: $('playBtn'), icoPlay: $('icoPlay'), icoPause: $('icoPause'),
     topBtn: $('topBtn'), backBtn: $('backBtn'), speed: $('speed'), speedVal: $('speedVal'),
     slower: $('slower'), faster: $('faster'), perPage: $('perPage'), countSel: $('countSel'), widthSel: $('widthSel'),
+    folderBar: $('folderBar'), sheet: $('sheet'), sheetTitle: $('sheetTitle'), sheetList: $('sheetList'),
     mini: $('mini'), miniSpeed: $('miniSpeed'), countdown: $('countdown'), countNum: $('countNum'), toast: $('toast')
   };
 
@@ -144,7 +158,8 @@
   }
 
   function newScore(id, title, pageCount) {
-    return { id, title, pageCount, created: Date.now(), speed: 10, countIn: 3, width: 100, pos: 0 };
+    const folder = (curFolder !== 'all' && curFolder !== 'none') ? curFolder : null;
+    return { id, title, pageCount, created: Date.now(), speed: 10, countIn: 3, width: 100, pos: 0, folder };
   }
 
   el.fileInput.addEventListener('change', async () => {
@@ -168,14 +183,109 @@
     }
   });
 
+  // ---------- フォルダ ----------
+  const FOLDER_KEY = 'score-scroll-folder';
+  let curFolder = 'all';   // 'all'（すべて）/ 'none'（未分類）/ フォルダのid
+  try { curFolder = localStorage.getItem(FOLDER_KEY) || 'all'; } catch (e) {}
+  function setFolder(id) {
+    curFolder = id;
+    try { localStorage.setItem(FOLDER_KEY, id); } catch (e) {}
+    renderLibrary();
+  }
+  function byOrder(a, b) { return (a.order || 0) - (b.order || 0) || a.created - b.created; }
+
+  // 下から出る選択メニュー
+  function openSheet(title, items) {
+    el.sheetTitle.textContent = title;
+    el.sheetList.textContent = '';
+    for (const it of items) {
+      const b = document.createElement('button');
+      b.className = 'sheet-btn' + (it.danger ? ' danger' : '') + (it.current ? ' current' : '');
+      b.textContent = it.label;
+      b.addEventListener('click', () => { closeSheet(); if (it.run) it.run(); });
+      el.sheetList.append(b);
+    }
+    const cancel = document.createElement('button');
+    cancel.className = 'sheet-btn cancel'; cancel.textContent = 'キャンセル';
+    cancel.addEventListener('click', closeSheet);
+    el.sheetList.append(cancel);
+    el.sheet.classList.remove('hidden');
+  }
+  function closeSheet() { el.sheet.classList.add('hidden'); }
+  el.sheet.addEventListener('click', (e) => { if (e.target === el.sheet) closeSheet(); });
+
+  async function createFolder() {
+    const name = prompt('新しいフォルダの名前', '');
+    if (!name || !name.trim()) return null;
+    const list = await store.folders();
+    const f = { id: 'f' + newId(), name: name.trim(), created: Date.now(), order: list.length };
+    await store.putFolder(f);
+    return f;
+  }
+  function editFolder(f) {
+    openSheet('フォルダ「' + f.name + '」', [
+      { label: '名前を変更', run: async () => {
+        const name = prompt('フォルダの名前', f.name);
+        if (name && name.trim()) { f.name = name.trim(); await store.putFolder(f); renderLibrary(); }
+      } },
+      { label: 'フォルダを削除', danger: true, run: async () => {
+        if (confirm('フォルダ「' + f.name + '」を削除しますか？\n中の楽譜は消えずに「未分類」に移ります。')) {
+          await store.removeFolder(f.id); setFolder('all'); toast('フォルダを削除しました');
+        }
+      } }
+    ]);
+  }
+  async function moveScore(s) {
+    const folders = (await store.folders()).sort(byOrder);
+    const items = [{ label: '未分類', current: !s.folder, run: async () => { s.folder = null; await store.put(s); renderLibrary(); toast('「未分類」に移動しました'); } }];
+    for (const f of folders) {
+      items.push({ label: f.name, current: s.folder === f.id, run: async () => { s.folder = f.id; await store.put(s); renderLibrary(); toast('「' + f.name + '」に移動しました'); } });
+    }
+    items.push({ label: '＋ 新しいフォルダを作って移動', run: async () => {
+      const f = await createFolder();
+      if (f) { s.folder = f.id; await store.put(s); renderLibrary(); toast('「' + f.name + '」に移動しました'); }
+    } });
+    openSheet('「' + s.title + '」の移動先', items);
+  }
+
+  function chip(label, count, active, onClick, extraClass) {
+    const b = document.createElement('button');
+    b.className = 'chip' + (active ? ' active' : '') + (extraClass ? ' ' + extraClass : '');
+    b.setAttribute('aria-pressed', active ? 'true' : 'false');
+    const t = document.createElement('span'); t.textContent = label; b.append(t);
+    if (count != null) { const c = document.createElement('span'); c.className = 'chip-count'; c.textContent = count; b.append(c); }
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
   // ---------- 一覧 ----------
   let thumbUrls = [];
   async function renderLibrary() {
     thumbUrls.forEach((u) => URL.revokeObjectURL(u));
     thumbUrls = [];
-    const list = (await store.all()).sort((a, b) => (b.opened || b.created) - (a.opened || a.created));
+    const [all, folders] = await Promise.all([store.all(), store.folders()]);
+    folders.sort(byOrder);
+    const fmap = new Map(folders.map((f) => [f.id, f]));
+    all.forEach((s) => { if (s.folder && !fmap.has(s.folder)) s.folder = null; });
+    if (curFolder !== 'all' && curFolder !== 'none' && !fmap.has(curFolder)) curFolder = 'all';
+
+    // フォルダのタブ
+    el.folderBar.textContent = '';
+    el.folderBar.append(chip('すべて', all.length, curFolder === 'all', () => setFolder('all')));
+    for (const f of folders) {
+      el.folderBar.append(chip(f.name, all.filter((s) => s.folder === f.id).length, curFolder === f.id, () => setFolder(f.id)));
+    }
+    const noneCount = all.filter((s) => !s.folder).length;
+    if (folders.length) el.folderBar.append(chip('未分類', noneCount, curFolder === 'none', () => setFolder('none')));
+    el.folderBar.append(chip('＋ フォルダ', null, false, async () => { const f = await createFolder(); if (f) setFolder(f.id); }, 'chip-add'));
+    if (fmap.has(curFolder)) el.folderBar.append(chip('フォルダを編集', null, false, () => editFolder(fmap.get(curFolder)), 'chip-edit'));
+
+    const list = all
+      .filter((s) => curFolder === 'all' ? true : curFolder === 'none' ? !s.folder : s.folder === curFolder)
+      .sort((a, b) => (b.opened || b.created) - (a.opened || a.created));
     el.grid.textContent = '';
     el.empty.classList.toggle('hidden', list.length > 0);
+    el.emptyText.textContent = all.length === 0 ? 'まだ楽譜がありません。' : 'このフォルダにはまだ楽譜がありません。';
     for (const s of list) {
       const card = document.createElement('div');
       card.className = 'card';
@@ -188,21 +298,27 @@
       const body = document.createElement('div');
       body.className = 'card-body';
       const t = document.createElement('div'); t.className = 'card-title'; t.textContent = s.title;
-      const m = document.createElement('div'); m.className = 'card-meta'; m.textContent = s.pageCount + 'ページ・速さ ' + s.speed;
+      const m = document.createElement('div'); m.className = 'card-meta';
+      m.textContent = s.pageCount + 'ページ・速さ ' + s.speed + (curFolder === 'all' && s.folder ? '・' + fmap.get(s.folder).name : '');
       body.append(t, m);
       open.append(img, body);
       open.addEventListener('click', () => openScore(s.id));
       const acts = document.createElement('div'); acts.className = 'card-actions';
-      const ren = document.createElement('button'); ren.className = 'mini'; ren.textContent = '名前を変更';
+      const ren = document.createElement('button'); ren.className = 'mini'; ren.textContent = '名前';
+      ren.setAttribute('aria-label', '「' + s.title + '」の名前を変更');
       ren.addEventListener('click', async () => {
         const name = prompt('楽譜の名前', s.title);
         if (name && name.trim()) { s.title = name.trim(); await store.put(s); renderLibrary(); }
       });
+      const mv = document.createElement('button'); mv.className = 'mini'; mv.textContent = '移動';
+      mv.setAttribute('aria-label', '「' + s.title + '」をフォルダへ移動');
+      mv.addEventListener('click', () => moveScore(s));
       const del = document.createElement('button'); del.className = 'mini'; del.textContent = '削除';
+      del.setAttribute('aria-label', '「' + s.title + '」を削除');
       del.addEventListener('click', async () => {
         if (confirm('「' + s.title + '」を削除しますか？')) { await store.remove(s); renderLibrary(); }
       });
-      acts.append(ren, del);
+      acts.append(ren, mv, del);
       card.append(open, acts);
       el.grid.append(card);
     }

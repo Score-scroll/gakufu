@@ -1,6 +1,6 @@
 // 楽譜スクロール：オフライン用サービスワーカー
 // アプリを更新したら VERSION の数字を変えると、iPad側も新しい版に入れ替わります。
-const VERSION = 'v2';
+const VERSION = 'v3';
 const CACHE = 'score-scroll-' + VERSION;
 const FILES = [
   './',
